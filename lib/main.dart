@@ -258,7 +258,7 @@ class AppStore extends ChangeNotifier {
           id: nextId(),
           name: name,
           title: _parseTitle(titleStr) ?? TitleType.airsider,
-          gender: _parseGender(genderStr) ?? _guessGenderFromName(name),
+          gender: _parseGender(genderStr) ?? _guessGenderFromName(name) ?? Gender.male,
           skills: skillsStr.isEmpty ? {} : skillsStr.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toSet(),
         ));
       }
@@ -308,7 +308,7 @@ class AppStore extends ChangeNotifier {
     // small but effective TR set
     const female = {
       'ayşe','fatma','emel','elif','zeynep','esra','kübra','kubra','meryem','hatice','sultan','şeyma','seyma',
-      'melike','gül','gul','gizem','eda','buse','tuğba','tugba','selin','derya','seda','naz','eda','cansu','aslı','asli'
+      'melike','gül','gul','gizem','eda','buse','tuğba','tugba','selin','derya','seda','naz','cansu','aslı','asli'
     };
     const male = {
       'ahmet','mehmet','ali','mustafa','osman','hasan','hüseyin','huseyin','ibrahim','ismail','murat','volkan','serkan',
@@ -431,6 +431,8 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  void refresh() => notifyListeners();
+
   // ---------- NEEDS + DAYS ----------
   void _regenerateNeeds() {
     needs.clear();
@@ -477,8 +479,6 @@ class AppStore extends ChangeNotifier {
 
   List<FlightNeed> _generateNeedsForFlight(FlightItem f) {
     final iata = f.iata;
-    final std = f.stdDateTime;
-
     FlightNeed mk({
       required String position,
       required int count,
@@ -1143,7 +1143,7 @@ class PersonsPage extends StatelessWidget {
                 value: p.active,
                 onChanged: (v) {
                   p.active = v;
-                  store.notifyListeners();
+                  store.refresh();
                 },
               ),
             ),
