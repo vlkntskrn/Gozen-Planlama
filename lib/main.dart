@@ -239,51 +239,69 @@ class AppStore extends ChangeNotifier {
     final sheet = excel.tables.values.firstOrNull;
     if (sheet == null) return 0;
 
-    // Try detect personnel-list header (Title/Gender/Skills)
-    final headerRow = _findHeaderRow(sheet, ['AD', 'SOY', 'TITLE']);
-    final maxCols = _maxCols(sheet);
-
     final incoming = <Person>[];
 
+    // 1) Personnel list style (preferred): A AdSoyad, B Title, C Gender, D Skills...
+    final headerRow = _findHeaderRow(sheet, ['TITLE', 'GENDER']) ??
+        _findHeaderRow(sheet, ['TITLE', 'CINSIYET']) ??
+        _findHeaderRow(sheet, ['TITLE', 'CİNSİYET']) ??
+        _findHeaderRow(sheet, ['TITLE']);
+
     if (headerRow != null) {
-      // Personnel list style
       for (int r = headerRow + 1; r < sheet.maxRows; r++) {
         final name = _cellToString(sheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: r)).value).trim();
         if (name.isEmpty) continue;
+
         final titleStr = _cellToString(sheet.cell(CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: r)).value).trim();
         final genderStr = _cellToString(sheet.cell(CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: r)).value).trim();
         final skillsStr = _cellToString(sheet.cell(CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: r)).value).trim();
 
+        final parsedTitle = _parseTitle(titleStr) ?? TitleType.airsider;
+        final parsedGender = _parseGender(genderStr) ?? (_guessGenderFromName(name) ?? Gender.male);
+
         incoming.add(Person(
           id: nextId(),
           name: name,
-          title: _parseTitle(titleStr) ?? TitleType.airsider,
-          gender: _parseGender(genderStr) ?? _guessGenderFromName(name) ?? Gender.male,
-          skills: skillsStr.isEmpty ? {} : skillsStr.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toSet(),
+          title: parsedTitle,
+          gender: parsedGender,
+          skills: skillsStr.isEmpty
+              ? {}
+              : skillsStr
+                  .split(',')
+                  .map((e) => e.trim())
+                  .where((e) => e.isNotEmpty)
+                  .toSet(),
         ));
       }
     } else {
-      // Work program template style: scrape names
-      final names = <String>{};
-      for (int r = 0; r < min(140, sheet.maxRows); r++) {
-        for (int c = 0; c < min(4, maxCols); c++) {
-          final cell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: r));
-          final s = _cellToString(cell.value).trim();
+      // 2) Work-program template style: scrape names AND infer gender from sections like "ERKEK"/"KADIN".
+      final maxCols = _maxCols(sheet);
+      Gender? sectionGender;
+      int alt = 0;
+
+      for (int r = 0; r < min(200, sheet.maxRows); r++) {
+        for (int c = 0; c < min(6, maxCols); c++) {
+          final s = _cellToString(sheet.cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: r)).value).trim();
           if (s.isEmpty) continue;
+
           final up = s.toUpperCase();
+          if (up.contains('KADIN')) {
+            sectionGender = Gender.female;
+            continue;
+          }
+          if (up.contains('ERKEK')) {
+            sectionGender = Gender.male;
+            continue;
+          }
+
           if (up.contains('SAAT') || up.contains('VARDIYA') || up.contains('TARİH') || up.contains('TARIH')) continue;
           if (s.length < 5) continue;
           if (!s.contains(' ')) continue;
           if (RegExp(r'\d').hasMatch(s)) continue;
-          names.add(s);
-        }
-      }
 
-      // Better than "all male airsider": guess gender by name and alternate if unknown
-      int alt = 0;
-      for (final n in names) {
-        final g = _guessGenderFromName(n);
-        incoming.add(Person(id: nextId(), name: n.trim(), title: TitleType.airsider, gender: g ?? ((alt++ % 2 == 0) ? Gender.male : Gender.female)));
+          final g = sectionGender ?? _guessGenderFromName(s) ?? ((alt++ % 2 == 0) ? Gender.male : Gender.female);
+          incoming.add(Person(id: nextId(), name: s, title: TitleType.airsider, gender: g));
+        }
       }
     }
 
@@ -837,38 +855,72 @@ class AppStore extends ChangeNotifier {
 
   // ---------- misc ----------
   String _iataFromFlightNo(String s) {
-    final up = s.toUpperCase().replaceAll(' ', '');
-    final m = RegExp(r'^[A-Z]{2,3}').firstMatch(up);
-    return m?.group(0) ?? up;
+  final up = s.toUpperCase().replaceAll(' ', '');
+  final m = RegExp(r'^[A-Z]{2,3}').firstMatch(up);
+  return m?.group(0) ?? up;
+}
+
+int _flightLoadForDay(DateTime d) =>
+    flights.where((f) => DateUtils.isSameDay(f.flightDay, d)).length;
+
+List<DateTime> _daysBetweenInclusive(DateTime start, DateTime end) {
+  final s = DateUtils.dateOnly(start);
+  final e = DateUtils.dateOnly(end);
+  final out = <DateTime>[];
+  for (DateTime d = s; !d.isAfter(e); d = d.add(const Duration(days: 1))) {
+    out.add(d);
+  }
+  return out;
+}
+
+_ShiftSuggestion _suggestShiftForDay(DateTime d) {
+  // Dynamic shift window based on that day's operations.
+  // Shift day = shiftStart day (locked).
+  final dayFlights =
+      flights.where((f) => DateUtils.isSameDay(f.flightDay, d)).toList();
+  if (dayFlights.isEmpty) return _ShiftSuggestion('V1', '09:00', '17:00');
+
+  DateTime earliest = dayFlights.first.oprStartDateTime ?? dayFlights.first.stdDateTime;
+  DateTime latestEnd = dayFlights.first.stdDateTime.add(const Duration(hours: 2));
+
+  for (final f in dayFlights) {
+    final opr = f.oprStartDateTime ?? f.stdDateTime;
+    if (opr.isBefore(earliest)) earliest = opr;
+
+    // end estimate: STD +2h, if CHUTE exists for this flight then +3h
+    final hasChute = needs.any((n) => n.flightId == f.id && n.position == 'CHUTE');
+    final end = f.stdDateTime.add(hasChute ? const Duration(hours: 3) : const Duration(hours: 2));
+    if (end.isAfter(latestEnd)) latestEnd = end;
   }
 
-  int _flightLoadForDay(DateTime d) => flights.where((f) => DateUtils.isSameDay(f.flightDay, d)).length;
+  // buffers
+  earliest = earliest.subtract(const Duration(minutes: 15));
+  latestEnd = latestEnd.add(const Duration(minutes: 15));
 
-  List<DateTime> _daysBetweenInclusive(DateTime start, DateTime end) {
-    final s = DateUtils.dateOnly(start);
-    final e = DateUtils.dateOnly(end);
-    final out = <DateTime>[];
-    for (DateTime d = s; !d.isAfter(e); d = d.add(const Duration(days: 1))) {
-      out.add(d);
-    }
-    return out;
+  // round to 15-minute grid
+  DateTime roundDown15(DateTime x) {
+    final m = x.minute - (x.minute % 15);
+    return DateTime(x.year, x.month, x.day, x.hour, m);
   }
 
-  _ShiftSuggestion _suggestShiftForDay(DateTime d) {
-    // derive from earliest OPR start hour among that day's flights; else default V1 09:00-17:00
-    final dayFlights = flights.where((f) => DateUtils.isSameDay(f.flightDay, d)).toList();
-    if (dayFlights.isEmpty) return _ShiftSuggestion('V1', '09:00', '17:00');
-    DateTime earliest = dayFlights.first.oprStartDateTime ?? dayFlights.first.stdDateTime;
-    for (final f in dayFlights) {
-      final t = f.oprStartDateTime ?? f.stdDateTime;
-      if (t.isBefore(earliest)) earliest = t;
-    }
-    final h = earliest.hour;
-    if (h < 9) return _ShiftSuggestion('V', '06:00', '14:00');
-    if (h < 15) return _ShiftSuggestion('V1', '09:00', '17:00');
-    if (h < 20) return _ShiftSuggestion('V3', '14:00', '22:00');
-    return _ShiftSuggestion('V7', '22:00', '06:00');
+  DateTime roundUp15(DateTime x) {
+    final add = (15 - (x.minute % 15)) % 15;
+    final y = x.add(Duration(minutes: add));
+    return DateTime(y.year, y.month, y.day, y.hour, y.minute);
   }
+
+  final shiftStart = roundDown15(earliest);
+  DateTime shiftEnd = roundUp15(latestEnd);
+
+  // minimize very long shifts (avoid 12h+ as default)
+  final maxDefault = const Duration(hours: 10);
+  if (shiftEnd.difference(shiftStart) > maxDefault) {
+    shiftEnd = shiftStart.add(maxDefault);
+  }
+
+  final code = _suggestShiftCode(shiftStart);
+  return _ShiftSuggestion(code, _fmtHHMM(shiftStart), _fmtHHMM(shiftEnd));
+}
 }
 
 class _ShiftSuggestion {
@@ -1388,6 +1440,20 @@ String _fmtHHMM(DateTime d) {
   final hh = d.hour.toString().padLeft(2, '0');
   final mi = d.minute.toString().padLeft(2, '0');
   return '$hh:$mi';
+}
+
+
+
+String _suggestShiftCode(DateTime shiftStart) {
+  final h = shiftStart.hour;
+  // V: sabah, V1-V2: gündüz, V3-V4: akşam, V7: gece
+  // Saat aralıkları sabit değil; burada kod seçimi "vardiya başlangıç saati bandı" ile yapılır.
+  if (h < 9) return 'V';      // ~06:00-09:00 başlangıç
+  if (h < 12) return 'V1';    // ~09:00-12:00
+  if (h < 15) return 'V2';    // ~12:00-15:00
+  if (h < 18) return 'V3';    // ~15:00-18:00
+  if (h < 21) return 'V4';    // ~18:00-21:00
+  return 'V7';                // ~21:00+
 }
 
 extension _FirstOrNull<T> on Iterable<T> {
