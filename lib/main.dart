@@ -1,790 +1,898 @@
-import 'dart:ui';
+
 import 'package:flutter/material.dart';
+import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
+import 'package:excel/excel.dart' as xl;
+
+
+TimeOfDay? parseHHMM(String s) {
+  // Accepts HH:MM (24h). Returns null if invalid.
+  final parts = s.split(':');
+  if (parts.length != 2) return null;
+  final h = int.tryParse(parts[0]);
+  final m = int.tryParse(parts[1]);
+  if (h == null || m == null) return null;
+  if (h < 0 || h > 23) return null;
+  if (m < 0 || m > 59) return null;
+  return TimeOfDay(hour: h, minute: m);
+
+
+DateTime? _parseExcelDateLocal(dynamic v) {
+  if (v == null) return null;
+  if (v is DateTime) return DateUtils.dateOnly(v);
+  // excel package sometimes returns xl.Data with .value; caller should pass raw .value
+  if (v is num) {
+    // Excel serial date (days since 1899-12-30)
+    final base = DateTime(1899, 12, 30);
+    return DateUtils.dateOnly(base.add(Duration(days: v.floor())));
+  }
+  final s = v.toString().trim();
+  if (s.isEmpty) return null;
+  // Try dd.MM.yyyy or dd/MM/yyyy
+  final m = RegExp(r'^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$').firstMatch(s);
+  if (m != null) {
+    final d = int.parse(m.group(1)!);
+    final mo = int.parse(m.group(2)!);
+    var y = int.parse(m.group(3)!);
+    if (y < 100) y += 2000;
+    return DateUtils.dateOnly(DateTime(y, mo, d));
+  }
+  return null;
+}
+
+TimeOfDay? _parseExcelTimeLocal(dynamic v) {
+  if (v == null) return null;
+  if (v is TimeOfDay) return v;
+  if (v is DateTime) return TimeOfDay(hour: v.hour, minute: v.minute);
+  if (v is num) {
+    // Excel serial time as fraction of day
+    final totalMinutes = (v * 24 * 60).round();
+    final h = (totalMinutes ~/ 60) % 24;
+    final m = totalMinutes % 60;
+    return TimeOfDay(hour: h, minute: m);
+  }
+  final s = v.toString().trim();
+  if (s.isEmpty) return null;
+  // accept HH:MM or H:MM
+  final m = RegExp(r'^(\d{1,2}):(\d{2})$').firstMatch(s);
+  if (m != null) {
+    final h = int.parse(m.group(1)!);
+    final mi = int.parse(m.group(2)!);
+    if (h >= 0 && h <= 23 && mi >= 0 && mi <= 59) return TimeOfDay(hour: h, minute: mi);
+  }
+  return parseHHMM(s);
+}
+
+}
 
 void main() {
-  runApp(const OpsPlannerApp());
+  runApp(const GozenApp());
 }
 
-/// Airport Ops Planner (V1 Skeleton)
-///
-/// Included:
-/// - In-memory store (no backend yet)
-/// - Personnel pool management (add/edit/deactivate)
-/// - Per-person constraints (no night/day/morning, max shift hours)
-/// - Requests (OFF / MORNING / DAY / EVENING / NIGHT) + manager approved flag
-/// - Rule toggles:
-///   - Min rest between shifts = 11h (locked)
-///   - Max 2 consecutive 12h shifts (default; can be overridden with employee request)
-///   - Max 2 consecutive night shifts (default; can be overridden with employee request)
-///   - Extra +1 Airsider buffer for every shift (gender alternates by shift)
-///   - Gate Observer rule set to MUST
-///
-/// Not included (placeholder buttons exist):
-/// - Excel import/export implementation (needs pubspec + packages)
-/// - Actual 15-day planning engine + flight assignment engine
-class OpsPlannerApp extends StatelessWidget {
-  const OpsPlannerApp({super.key});
+class GozenApp extends StatelessWidget {
+  const GozenApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Ops Planner',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+    return AppStoreScope(
+      store: AppStore()..seedDemo(),
+      child: MaterialApp(
+        debugShowCheckedModeBanner: false,
+        title: 'Gozen Planlama',
+        theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
+        home: const HomePage(),
       ),
-      home: const AppShell(),
     );
   }
 }
 
-class AppShell extends StatefulWidget {
-  const AppShell({super.key});
+enum AppRole { admin, supervisor, agent }
+enum TitleType { airsider, interviewer, teamLeader, tarmacTeamLeader }
+enum Gender { male, female }
+enum RequestType { off, sabah, gunduz, aksam, gece }
 
-  @override
-  State<AppShell> createState() => _AppShellState();
-}
-
-class _AppShellState extends State<AppShell> {
-  final Store store = Store.seed();
-  int index = 0;
-
-  @override
-  Widget build(BuildContext context) {
-    final pages = <Widget>[
-      DashboardPage(store: store),
-      PersonnelPage(store: store),
-      RulesPage(store: store),
-      RequestsPage(store: store),
-      ImportExportPage(store: store),
-    ];
-
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(_titleFor(index)),
-        actions: [
-          IconButton(
-            tooltip: 'About',
-            onPressed: () => showDialog(
-              context: context,
-              builder: (_) => const AboutDialog(
-                applicationName: 'Ops Planner',
-                applicationVersion: 'V1 Skeleton',
-                applicationLegalese:
-                    'Prototype UI for personnel pool, constraints & requests.',
-              ),
-            ),
-            icon: const Icon(Icons.info_outline),
-          ),
-        ],
-      ),
-      body: pages[index],
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: index,
-        onDestinationSelected: (i) => setState(() => index = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.dashboard_outlined), label: 'Dashboard'),
-          NavigationDestination(icon: Icon(Icons.people_outline), label: 'Personel'),
-          NavigationDestination(icon: Icon(Icons.rule_folder_outlined), label: 'Kurallar'),
-          NavigationDestination(icon: Icon(Icons.event_note_outlined), label: 'Talepler'),
-          NavigationDestination(icon: Icon(Icons.file_present_outlined), label: 'Import/Export'),
-        ],
-      ),
-    );
-  }
-
-  String _titleFor(int i) {
-    switch (i) {
-      case 0:
-        return 'Dashboard';
-      case 1:
-        return 'Personel';
-      case 2:
-        return 'Kurallar';
-      case 3:
-        return 'Talepler';
-      case 4:
-        return 'Import / Export';
-      default:
-        return 'Ops Planner';
-    }
+String appRoleLabel(AppRole r) {
+  switch (r) {
+    case AppRole.admin:
+      return 'Admin';
+    case AppRole.supervisor:
+      return 'Supervisor';
+    case AppRole.agent:
+      return 'Agent';
   }
 }
 
-/* =========================
-   Domain models
-========================= */
+String titleLabel(TitleType t) {
+  switch (t) {
+    case TitleType.airsider:
+      return 'Airsider';
+    case TitleType.interviewer:
+      return 'Interviewer';
+    case TitleType.teamLeader:
+      return 'Team Leader';
+    case TitleType.tarmacTeamLeader:
+      return 'Tarmac Team Leader';
+  }
+}
 
-enum Gender { erkek, kadin, diger }
+String genderLabel(Gender g) => g == Gender.male ? 'Erkek' : 'Kadın';
 
-enum ShiftPref { off, sabah, gunduz, aksam, gece }
+String requestTypeLabel(RequestType t) {
+  switch (t) {
+    case RequestType.off:
+      return 'OFF';
+    case RequestType.sabah:
+      return 'Sabah';
+    case RequestType.gunduz:
+      return 'Gündüz';
+    case RequestType.aksam:
+      return 'Akşam';
+    case RequestType.gece:
+      return 'Gece';
+  }
+}
 
-class Person {
-  Person({
-    required this.id,
-    required this.fullName,
-    required this.title,
-    required this.gender,
-    required this.skills,
-    this.active = true,
-    this.appRole = 'OCC',
-  });
-
-  final String id;
-  String fullName;
-  String title; // e.g. Airsider, Interviewer, Team Leader, Tarmac TL
-  Gender gender;
-  List<String> skills; // editable tags
-  bool active;
-  String appRole; // Admin/OCC/Supervisor/Agent (kept as string for now)
+List<String> skillsForTitle(TitleType t) {
+  switch (t) {
+    case TitleType.airsider:
+      return const ['BA CHUTE', 'APIS'];
+    case TitleType.interviewer:
+      return const ['Doc. Check'];
+    case TitleType.teamLeader:
+    case TitleType.tarmacTeamLeader:
+      return const [];
+  }
 }
 
 class PersonConstraints {
+  bool geceYok;
+  bool gunduzYok;
+  bool sabahYok;
+  int maxVardiyaSaat;
+  String note;
+
   PersonConstraints({
-    required this.personId,
     this.geceYok = false,
     this.gunduzYok = false,
     this.sabahYok = false,
     this.maxVardiyaSaat = 12,
     this.note = '',
   });
-
-  final String personId;
-  bool geceYok;
-  bool gunduzYok;
-  bool sabahYok;
-  int maxVardiyaSaat;
-  String note;
 }
 
-class PersonRequest {
-  PersonRequest({
-    required this.id,
-    required this.personId,
-    required this.date,
-    required this.pref,
-    this.managerApproved = false,
-    this.note = '',
-  });
+class Person {
+  final String id;
+  String name;
+  AppRole appRole;
+  TitleType title;
+  Gender gender;
+  List<String> skills;
+  bool active;
+  PersonConstraints constraints;
 
+  Person({
+    required this.id,
+    required this.name,
+    required this.appRole,
+    required this.title,
+    required this.gender,
+    required this.skills,
+    required this.active,
+    required this.constraints,
+  });
+}
+
+class StaffRequest {
   final String id;
   final String personId;
   DateTime date;
-  ShiftPref pref;
+  RequestType type;
   bool managerApproved;
   String note;
+
+  StaffRequest({
+    required this.id,
+    required this.personId,
+    required this.date,
+    required this.type,
+    this.managerApproved = false,
+    this.note = '',
+  });
 }
 
-class PlanningRules {
-  PlanningRules({
-    this.minRestHours = 11,
-    this.maxConsecutive12h = 2,
-    this.maxConsecutiveNight = 2,
-    this.allowOverrideWithRequest = true,
-    this.requestQuotaPer15Days = 5,
-    this.extraAirsiderPerShift = 1,
-    this.alternateExtraAirsiderGender = true,
-    this.startExtraAirsiderGender = Gender.erkek,
-    this.gateObserverMust = true,
+class FlightItem {
+  final String id;
+  DateTime date;
+  String flightNo;
+  String destination;
+  TimeOfDay std;
+  TimeOfDay? sta;
+
+  FlightItem({
+    required this.id,
+    required this.date,
+    required this.flightNo,
+    required this.destination,
+    required this.std,
+    this.sta,
   });
-
-  int minRestHours; // Excel kuralı: 11 saat
-  int maxConsecutive12h;
-  int maxConsecutiveNight;
-  bool allowOverrideWithRequest;
-  int requestQuotaPer15Days;
-
-  // No-show risk buffer
-  int extraAirsiderPerShift; // user rule: every shift +1
-  bool alternateExtraAirsiderGender; // male/female alternating by shift
-  Gender startExtraAirsiderGender; // first shift's extra gender
-
-  // Position requirement rule
-  bool gateObserverMust; // changed from "if available" to MUST
 }
 
-/* =========================
-   In-memory store
-========================= */
 
-class Store extends ChangeNotifier {
-  Store({
-    required this.people,
-    required this.constraintsByPerson,
-    required this.requests,
-    required this.rules,
+enum FlightPosition {
+  checkinInterviewer,
+  checkinTeamLeader,
+  checkinSupervisor,
+  checkinApis,
+  gateTeamLeader,
+  gateDocCheck,
+  gatePaxId,
+  gateSearch1,
+  gateSearch2,
+  gateObserver,
+  gateApis,
+  ramp,
+  back,
+  jetty,
+  chute,
+  baggageEscort,
+  catering,
+  barcode,
+  cargo,
+  cargoEscort,
+  acSearch,
+  tarmacTeamLeader,
+  extraAirsiderBuffer,
+}
+
+
+String positionLabel(FlightPosition p) {
+  switch (p) {
+    case FlightPosition.checkinInterviewer:
+      return 'Check-in Interviewer';
+    case FlightPosition.checkinTeamLeader:
+      return 'Check-in Team Leader';
+    case FlightPosition.checkinSupervisor:
+      return 'Check-in Supervisor';
+    case FlightPosition.checkinApis:
+      return 'Check-in APIS';
+    case FlightPosition.gateTeamLeader:
+      return 'Gate Team Leader';
+    case FlightPosition.gateDocCheck:
+      return 'Gate Doc. Check';
+    case FlightPosition.gatePaxId:
+      return 'Gate Pax ID';
+    case FlightPosition.gateSearch1:
+      return 'Gate Search 1';
+    case FlightPosition.gateSearch2:
+      return 'Gate Search 2';
+    case FlightPosition.gateObserver:
+      return 'Gate Observer';
+    case FlightPosition.gateApis:
+      return 'Gate APIS';
+    case FlightPosition.ramp:
+      return 'Ramp';
+    case FlightPosition.back:
+      return 'Back';
+    case FlightPosition.jetty:
+      return 'Jetty';
+    case FlightPosition.chute:
+      return 'Chute';
+    case FlightPosition.baggageEscort:
+      return 'Baggage Escort';
+    case FlightPosition.catering:
+      return 'Catering';
+    case FlightPosition.barcode:
+      return 'Barcode';
+    case FlightPosition.cargo:
+      return 'Cargo';
+    case FlightPosition.cargoEscort:
+      return 'Cargo Escort';
+    case FlightPosition.acSearch:
+      return 'A/C Search';
+    case FlightPosition.tarmacTeamLeader:
+      return 'Tarmac Team Leader';
+    case FlightPosition.extraAirsiderBuffer:
+      return 'Extra Airsider (No-show)';
+  }
+}
+
+
+class FlightNeed {
+  final String id;
+  final String flightId;
+  FlightPosition position;
+  int requiredCount;
+
+  // Basit kural alanları (V1)
+  TitleType requiredTitle;
+  Gender? requiredGender; // null = fark etmez
+  String? requiredSkill; // null = yok
+
+  // Vardiya önerisi (V1)
+  String? shiftCode;
+  TimeOfDay? shiftStart;
+  TimeOfDay? shiftEnd;
+
+  FlightNeed({
+    required this.id,
+    required this.flightId,
+    required this.position,
+    required this.requiredCount,
+    required this.requiredTitle,
+    this.requiredGender,
+    this.requiredSkill,
+    this.shiftCode,
+    this.shiftStart,
+    this.shiftEnd,
   });
+}
 
-  final List<Person> people;
-  final Map<String, PersonConstraints> constraintsByPerson;
-  final List<PersonRequest> requests;
-  final PlanningRules rules;
 
-  static Store seed() {
-    final p1 = Person(
-      id: _id(),
-      fullName: 'Ali Yılmaz',
-      title: 'Airsider',
-      gender: Gender.erkek,
-      skills: ['AS', 'Gate'],
-    );
-    final p2 = Person(
-      id: _id(),
-      fullName: 'Ayşe Demir',
-      title: 'Interviewer',
-      gender: Gender.kadin,
-      skills: ['INT', 'APIS'],
-    );
-    return Store(
-      people: [p1, p2],
-      constraintsByPerson: {
-        p1.id: PersonConstraints(personId: p1.id, geceYok: false, maxVardiyaSaat: 12),
-        p2.id: PersonConstraints(personId: p2.id, geceYok: true, maxVardiyaSaat: 10),
-      },
-      requests: [],
-      rules: PlanningRules(),
-    );
-  }
+class _NeedTemplate {
+  final FlightPosition pos;
+  final String necessity; // MUST / IF AVAIBLE
+  final int count;
+  final TitleType? title;
+  final Gender? gender; // null = fark etmez
+  final String? skill;
 
-  PersonConstraints constraintsOf(String personId) {
-    return constraintsByPerson[personId] ??= PersonConstraints(personId: personId);
-  }
+  const _NeedTemplate({
+    required this.pos,
+    required this.necessity,
+    required this.count,
+    this.title,
+    this.gender,
+    this.skill,
+  });
+}
 
-  void addPerson(Person p) {
-    people.add(p);
-    constraintsByPerson.putIfAbsent(p.id, () => PersonConstraints(personId: p.id));
+const Map<String, List<_NeedTemplate>> kIataNeedTemplates = {
+  // Gate olmayan IATA'lar (OR / X3 / BLX / TB): sadece Ramp/Back/Jetty + Tarmac TL
+  'OR': [
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+  'X3': [
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+  'BLX': [
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+  'TB': [
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+
+  // 6B (Excel'de Nordic) - gate yok olarak belirtilmişti, aynı şablon
+  '6B': [
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+
+  // UK gate + airside setleri
+  'LS': [
+    _NeedTemplate(pos: FlightPosition.gateTeamLeader, necessity: 'MUST', count: 1, title: TitleType.teamLeader),
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.gateObserver, necessity: 'IF AVAIBLE', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.chute, necessity: 'MUST', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+  'FHY': [
+    _NeedTemplate(pos: FlightPosition.gateTeamLeader, necessity: 'MUST', count: 1, title: TitleType.teamLeader),
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.gateObserver, necessity: 'IF AVAIBLE', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.chute, necessity: 'MUST', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+  'BA': [
+    _NeedTemplate(pos: FlightPosition.gateTeamLeader, necessity: 'MUST', count: 1, title: TitleType.teamLeader, skill: 'Doc. Check'),
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.gateObserver, necessity: 'IF AVAIBLE', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.chute, necessity: 'MUST', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.baggageEscort, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+  'TK': [
+    _NeedTemplate(pos: FlightPosition.gateTeamLeader, necessity: 'MUST', count: 1, title: TitleType.teamLeader),
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.gateObserver, necessity: 'IF AVAIBLE', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.jetty, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.chute, necessity: 'MUST', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.baggageEscort, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+
+  // XQ ve TOM: CHUTE YOK (kilit)
+  'XQ': [
+    _NeedTemplate(pos: FlightPosition.gateTeamLeader, necessity: 'MUST', count: 1, title: TitleType.teamLeader),
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.gateObserver, necessity: 'IF AVAIBLE', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+  'TOM': [
+    _NeedTemplate(pos: FlightPosition.gateTeamLeader, necessity: 'MUST', count: 1, title: TitleType.teamLeader),
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.gateObserver, necessity: 'IF AVAIBLE', count: 1, title: TitleType.airsider),
+    _NeedTemplate(pos: FlightPosition.ramp, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.back, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.tarmacTeamLeader, necessity: 'MUST', count: 1, title: TitleType.tarmacTeamLeader),
+  ],
+
+  // Diğer gate-only IATA'lar (gate ekibi)
+  'EW': [
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+    _NeedTemplate(pos: FlightPosition.gateObserver, necessity: 'IF AVAIBLE', count: 1, title: TitleType.airsider),
+  ],
+  'OS': [
+    _NeedTemplate(pos: FlightPosition.gateTeamLeader, necessity: 'MUST', count: 1, title: TitleType.teamLeader),
+    _NeedTemplate(pos: FlightPosition.gatePaxId, necessity: 'MUST', count: 1, title: TitleType.interviewer),
+    _NeedTemplate(pos: FlightPosition.gateSearch1, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.male),
+    _NeedTemplate(pos: FlightPosition.gateSearch2, necessity: 'MUST', count: 1, title: TitleType.airsider, gender: Gender.female),
+  ],
+};
+
+
+
+
+class RulesConfig {
+  int requestLimit15Days = 5;
+  int maxConsecutiveWorkDays = 6;
+  int maxConsecutive12hDays = 2;
+  int maxConsecutiveNightDays = 2;
+  int minRestHoursBetweenShifts = 11;
+
+  // Off hedefleri (15 gün)
+  int offTargetAirsiderInterviewer = 3;
+  int offTargetTeamLeaderTarmac = 4;
+
+  bool extraAirsiderPerShift = true;
+  bool alternateExtraAirsiderGender = true;
+  Gender startExtraAirsiderGender = Gender.male;
+  bool gateObserverMust = true;
+}
+
+class AppStore extends ChangeNotifier {
+  final List<Person> persons = [];
+  final List<StaffRequest> requests = [];
+  final List<FlightItem> flights = [];
+  final List<FlightNeed> needs = [];
+  final RulesConfig rules = RulesConfig();
+
+  Gender _nextExtraGender = Gender.male;
+
+  int _id = 0;
+  String nextId() => (++_id).toString();
+
+  void seedDemo() {
+    _nextExtraGender = rules.startExtraAirsiderGender;
+    persons.addAll([
+      Person(
+        id: nextId(),
+        name: 'Ahmet Yılmaz',
+        appRole: AppRole.agent,
+        title: TitleType.airsider,
+        gender: Gender.male,
+        skills: ['APIS'],
+        active: true,
+        constraints: PersonConstraints(),
+      ),
+      Person(
+        id: nextId(),
+        name: 'Ayşe Demir',
+        appRole: AppRole.agent,
+        title: TitleType.airsider,
+        gender: Gender.female,
+        skills: ['BA CHUTE'],
+        active: true,
+        constraints: PersonConstraints(),
+      ),
+      Person(
+        id: nextId(),
+        name: 'Can Kaya',
+        appRole: AppRole.supervisor,
+        title: TitleType.interviewer,
+        gender: Gender.male,
+        skills: ['Doc. Check'],
+        active: true,
+        constraints: PersonConstraints(maxVardiyaSaat: 8),
+      ),
+    ]);
     notifyListeners();
   }
 
-  void updatePerson(Person p) {
-    final idx = people.indexWhere((x) => x.id == p.id);
-    if (idx >= 0) {
-      people[idx] = p;
-      notifyListeners();
+  void addOrUpdatePerson(Person p) {
+    final i = persons.indexWhere((e) => e.id == p.id);
+    if (i >= 0) {
+      persons[i] = p;
+    } else {
+      persons.add(p);
     }
-  }
-
-  void toggleActive(String personId, bool active) {
-    final p = people.firstWhere((x) => x.id == personId);
-    p.active = active;
     notifyListeners();
   }
 
-  void saveConstraints(PersonConstraints c) {
-    constraintsByPerson[c.personId] = c;
+  void togglePersonActive(String id) {
+    final p = persons.firstWhere((e) => e.id == id);
+    p.active = !p.active;
     notifyListeners();
   }
 
-  void addRequest(PersonRequest r) {
-    requests.add(r);
+  void deletePerson(String id) {
+    persons.removeWhere((e) => e.id == id);
+    requests.removeWhere((e) => e.personId == id);
     notifyListeners();
   }
 
-  void updateRequest(PersonRequest r) {
-    final idx = requests.indexWhere((x) => x.id == r.id);
-    if (idx >= 0) {
-      requests[idx] = r;
-      notifyListeners();
+  int requestsIn15Days(String personId, DateTime centerDate) {
+    final start = DateUtils.dateOnly(centerDate.subtract(const Duration(days: 14)));
+    final end = DateUtils.dateOnly(centerDate);
+    return requests.where((r) {
+      final d = DateUtils.dateOnly(r.date);
+      return r.personId == personId &&
+          !d.isBefore(start) &&
+          !d.isAfter(end);
+    }).length;
+  }
+
+  String? canAddRequest(String personId, DateTime date, {String? editingId}) {
+    final count = requests.where((r) {
+      if (editingId != null && r.id == editingId) return false;
+      final start = DateUtils.dateOnly(date.subtract(const Duration(days: 14)));
+      final d = DateUtils.dateOnly(r.date);
+      return r.personId == personId &&
+          !d.isBefore(start) &&
+          !d.isAfter(DateUtils.dateOnly(date));
+    }).length;
+    if (count >= rules.requestLimit15Days) {
+      return '15 günde talep limiti aşıldı (${rules.requestLimit15Days})';
     }
+    return null;
+  }
+
+  void addOrUpdateRequest(StaffRequest r) {
+    final i = requests.indexWhere((e) => e.id == r.id);
+    if (i >= 0) {
+      requests[i] = r;
+    } else {
+      requests.add(r);
+    }
+    requests.sort((a, b) => a.date.compareTo(b.date));
+    notifyListeners();
   }
 
   void deleteRequest(String id) {
-    requests.removeWhere((x) => x.id == id);
+    requests.removeWhere((e) => e.id == id);
     notifyListeners();
   }
 
-  int requestCountInWindow(String personId, DateTime endInclusive) {
-    final start = endInclusive.subtract(const Duration(days: 14));
-    return requests
-        .where((r) => r.personId == personId)
-        .where((r) => !r.date.isBefore(start) && !r.date.isAfter(endInclusive))
-        .length;
+  void addOrUpdateFlight(FlightItem f) {
+    final i = flights.indexWhere((e) => e.id == f.id);
+    if (i >= 0) {
+      flights[i] = f;
+    } else {
+      flights.add(f);
+    }
+    flights.sort((a, b) {
+      final d = DateUtils.dateOnly(a.date).compareTo(DateUtils.dateOnly(b.date));
+      if (d != 0) return d;
+      return _todMinutes(a.std).compareTo(_todMinutes(b.std));
+    });
+
+    // Kullanıcıya göstermeden otomatik ihtiyaç + vardiya önerisi üret
+    generateNeedsForFlight(f.id);
+    suggestShiftsForFlight(f.id);
   }
 
-  static String _id() => DateTime.now().microsecondsSinceEpoch.toString();
-}
-
-/* =========================
-   Pages
-========================= */
-
-class DashboardPage extends StatefulWidget {
-  const DashboardPage({super.key, required this.store});
-  final Store store;
-
-  @override
-  State<DashboardPage> createState() => _DashboardPageState();
-}
-
-class _DashboardPageState extends State<DashboardPage> {
-  late DateTime selected = DateTime.now();
-
-  @override
-  Widget build(BuildContext context) {
-    final activeCount = widget.store.people.where((p) => p.active).length;
-    final total = widget.store.people.length;
-
-    return AnimatedBuilder(
-      animation: widget.store,
-      builder: (_, __) {
-        final store = widget.store;
-        final r = store.rules;
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            _Card(
-              title: 'Özet',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Personel: $activeCount aktif / $total toplam'),
-                  const SizedBox(height: 8),
-                  Text('Min dinlenme: ${widget.store.rules.minRestHours} saat'),
-                  Text('Ekstra Airsider/shift: ${widget.store.rules.extraAirsiderPerShift}'),
-                  Text("Gate Observer: ${widget.store.rules.gateObserverMust ? 'MUST' : 'Opsiyonel'}"),
-                  Text('12s ardışık limit: ${widget.store.rules.maxConsecutive12h} (talep ile esnetilebilir: ${widget.store.rules.allowOverrideWithRequest ? "Evet" : "Hayır"})'),
-                  Text('Gece ardışık limit: ${widget.store.rules.maxConsecutiveNight} (talep ile esnetilebilir: ${widget.store.rules.allowOverrideWithRequest ? "Evet" : "Hayır"})'),
-                  const Divider(height: 24),
-                  _IntStepper(
-                    label: 'Vardiya başı ekstra Airsider',
-                    value: r.extraAirsiderPerShift,
-                    min: 0,
-                    max: 3,
-                    onChanged: (v) {
-                      r.extraAirsiderPerShift = v;
-                      store.notifyListeners();
-                    },
-                    helperText: 'No-show risk buffer için her vardiyaya fazladan Airsider.',
-                  ),
-                  const Divider(height: 24),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: const Text('Ekstra Airsider cinsiyetini dönüşümlü planla'),
-                    subtitle: const Text('Bir vardiyada erkek ekstra ise sonraki vardiyada kadın ekstra planlanır.'),
-                    value: r.alternateExtraAirsiderGender,
-                    onChanged: (v) {
-                      r.alternateExtraAirsiderGender = v;
-                      store.notifyListeners();
-                    },
-                  ),
-                  const SizedBox(height: 8),
-                  DropdownButtonFormField<Gender>(
-                    value: r.startExtraAirsiderGender,
-                    decoration: const InputDecoration(
-                      labelText: 'İlk vardiya ekstra Airsider cinsiyeti',
-                      border: OutlineInputBorder(),
-                    ),
-                    items: Gender.values
-                        .map(
-                          (g) => DropdownMenuItem(
-                            value: g,
-                            child: Text(g == Gender.erkek ? 'Erkek' : 'Kadın'),
-                          ),
-                        )
-                        .toList(),
-                    onChanged: (v) {
-                      if (v == null) return;
-                      r.startExtraAirsiderGender = v;
-                      store.notifyListeners();
-                    },
-                  ),
-                  const Divider(height: 24),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: const Text('Gate Observer zorunlu'),
-                    subtitle: const Text('Önceki kural: if available. Yeni kural: MUST.'),
-                    value: r.gateObserverMust,
-                    onChanged: (v) {
-                      r.gateObserverMust = v;
-                      store.notifyListeners();
-                    },
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-            _Card(
-              title: 'Tarih',
-              child: Row(
-                children: [
-                  Text(_fmtDate(selected)),
-                  const Spacer(),
-                  FilledButton.icon(
-                    onPressed: () async {
-                      final picked = await showDatePicker(
-                        context: context,
-                        firstDate: DateTime(2025, 1, 1),
-                        lastDate: DateTime(2030, 12, 31),
-                        initialDate: selected,
-                      );
-                      if (picked != null) setState(() => selected = picked);
-                    },
-                    icon: const Icon(Icons.calendar_month_outlined),
-                    label: const Text('Seç'),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-            _Card(
-              title: 'Plan Motoru (placeholder)',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Bu sürümde plan motoru yok; sadece UI + veri modeli var.'),
-                  const SizedBox(height: 12),
-                  FilledButton(
-                    onPressed: () => _toast(context, 'Plan motoru sonraki adım.'),
-                    child: const Text('15 Günlük Plan Üret'),
-                  ),
-                  const SizedBox(height: 8),
-                  FilledButton.tonal(
-                    onPressed: () => _toast(context, 'Günlük pozisyonlandırma sonraki adım.'),
-                    child: const Text('Günlük Pozisyonlandır'),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        );
-      },
-    );
+  void deleteFlight(String id) {
+    flights.removeWhere((e) => e.id == id);
+    needs.removeWhere((n) => n.flightId == id);
+    notifyListeners();
   }
+
+
+List<FlightNeed> needsForFlight(String flightId) {
+  return needs.where((n) => n.flightId == flightId).toList()
+    ..sort((a, b) => a.position.index.compareTo(b.position.index));
 }
 
-class PersonnelPage extends StatelessWidget {
-  const PersonnelPage({super.key, required this.store});
-  final Store store;
+void setNeedCount(String needId, int count) {
+  final i = needs.indexWhere((e) => e.id == needId);
+  if (i < 0) return;
+  needs[i].requiredCount = count.clamp(0, 99);
+  notifyListeners();
+}
 
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: store,
-      builder: (_, __) {
-        final people = [...store.people]..sort((a, b) => a.fullName.compareTo(b.fullName));
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Row(
-              children: [
-                const Expanded(child: Text('Personel Havuzu', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600))),
-                FilledButton.icon(
-                  onPressed: () async {
-                    final created = await Navigator.of(context).push<Person?>(
-                      MaterialPageRoute(builder: (_) => PersonEditorPage(store: store)),
-                    );
-                    if (created != null) store.addPerson(created);
-                  },
-                  icon: const Icon(Icons.person_add_alt_1_outlined),
-                  label: const Text('Ekle'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            for (final p in people) ...[
-              _PersonTile(store: store, person: p),
-              const SizedBox(height: 8),
-            ],
-          ],
-        );
-      },
-    );
+
+void generateNeedsForFlight(String flightId) {
+  // Excel kural setinden gömülü IATA şablonlarına göre ihtiyaç üretir.
+  needs.removeWhere((n) => n.flightId == flightId);
+
+  FlightItem? flight;
+  for (final f in flights) {
+    if (f.id == flightId) {
+      flight = f;
+      break;
+    }
+  }
+  if (flight == null) {
+    notifyListeners();
+    return;
+  }
+
+  final iata = _extractIata(flight.flightNo);
+  final templates = kIataNeedTemplates[iata];
+
+  if (templates == null) {
+    // Fallback: sadece temel Gate Search + Gate Observer (rule'a göre)
+    needs.add(FlightNeed(
+      id: nextId(),
+      flightId: flightId,
+      position: FlightPosition.gateSearch1,
+      requiredCount: 1,
+      requiredTitle: TitleType.airsider,
+    ));
+    needs.add(FlightNeed(
+      id: nextId(),
+      flightId: flightId,
+      position: FlightPosition.gateSearch2,
+      requiredCount: 1,
+      requiredTitle: TitleType.airsider,
+    ));
+    if (rules.gateObserverMust) {
+      needs.add(FlightNeed(
+        id: nextId(),
+        flightId: flightId,
+        position: FlightPosition.gateObserver,
+        requiredCount: 1,
+        requiredTitle: TitleType.airsider,
+      ));
+    }
+    notifyListeners();
+    return;
+  }
+
+  for (final t in templates) {
+    final nec = t.necessity.toUpperCase().trim();
+
+    // IF AVAIBLE sadece Gate Observer için; MUST değilse gateObserverMust'a göre al.
+    if (nec.startsWith('IF')) {
+      if (!(t.pos == FlightPosition.gateObserver && rules.gateObserverMust)) {
+        continue;
+      }
+    } else if (nec != 'MUST') {
+      continue;
+    }
+
+    needs.add(FlightNeed(
+      id: nextId(),
+      flightId: flightId,
+      position: t.pos,
+      requiredCount: t.count,
+      requiredTitle: t.title ?? TitleType.airsider,
+      requiredGender: t.gender,
+      requiredSkill: t.skill,
+    ));
+  }
+
+  notifyListeners();
+}
+
+String _extractIata(String flightNo) {
+  final m = RegExp(r'^[A-Za-z]+').firstMatch(flightNo.trim());
+  return (m?.group(0) ?? '').toUpperCase();
+}
+
+
+
+
+
+  int _todMinutes(TimeOfDay t) => t.hour * 60 + t.minute;
+
+  
+
+// Vardiya kodu + saat önerisi (V1)
+void suggestShiftsForFlight(String flightId) {
+  FlightItem? flight;
+  for (final f in flights) {
+    if (f.id == flightId) {
+      flight = f;
+      break;
+    }
+  }
+  if (flight == null) return;
+
+  final code0 = _suggestShiftCode(flight.std);
+
+for (final n in needs.where((e) => e.flightId == flightId)) {
+  // Default: STD'den 60 dk önce başla, 8 saat sür.
+  // Ramp/Back/Jetty için min 2:00 (120 dk) offset kuralı uygulanır.
+  final start = _addMinutes(flight.std, _startOffsetMinutesForPosition(n.position));
+  final end = _addMinutes(start, 8 * 60); // default 8 saat
+
+  n.shiftCode = code0;
+  n.shiftStart = start;
+  n.shiftEnd = end;
+}
+
+  if (rules.extraAirsiderPerShift) {
+    final exists = needs.any((n) => n.flightId == flightId && n.position == FlightPosition.extraAirsiderBuffer);
+    if (!exists) {
+      final extraGender = _nextExtraGender;
+      final start = _addMinutes(flight.std, _startOffsetMinutesForPosition(FlightPosition.extraAirsiderBuffer));
+      final end = _addMinutes(start, 8 * 60);
+      needs.add(FlightNeed(
+        id: nextId(),
+        flightId: flightId,
+        position: FlightPosition.extraAirsiderBuffer,
+        requiredCount: 1,
+        requiredTitle: TitleType.airsider,
+        requiredGender: extraGender,
+        shiftCode: code0,
+        shiftStart: start,
+        shiftEnd: end,
+      ));
+
+      if (rules.alternateExtraAirsiderGender) {
+        _nextExtraGender = (extraGender == Gender.male) ? Gender.female : Gender.male;
+      }
+    }
+  }
+
+  notifyListeners();
+}
+
+
+int _startOffsetMinutesForPosition(FlightPosition p) {
+  switch (p) {
+    case FlightPosition.ramp:
+    case FlightPosition.back:
+    case FlightPosition.jetty:
+      return -120; // 2:00
+    default:
+      return -60;
   }
 }
 
-class _PersonTile extends StatelessWidget {
-  const _PersonTile({required this.store, required this.person});
-  final Store store;
-  final Person person;
+String _suggestShiftCode(TimeOfDay std) {
+  final h = std.hour;
+  if (h < 10) return 'V';
+  if (h < 16) return 'V1';
+  if (h < 22) return 'V3';
+  return 'V7';
+}
+
+TimeOfDay _addMinutes(TimeOfDay t, int minutes) {
+  final total = t.hour * 60 + t.minute + minutes;
+  final wrapped = ((total % (24 * 60)) + (24 * 60)) % (24 * 60);
+  return TimeOfDay(hour: wrapped ~/ 60, minute: wrapped % 60);
+}
+
+void notifyRulesChanged() => notifyListeners();
+}
+
+class AppStoreScope extends InheritedNotifier<AppStore> {
+  const AppStoreScope({super.key, required AppStore store, required Widget child})
+      : super(notifier: store, child: child);
+
+  static AppStore of(BuildContext context) {
+    final scope = context.dependOnInheritedWidgetOfExactType<AppStoreScope>();
+    return scope!.notifier!;
+  }
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  int index = 0;
 
   @override
   Widget build(BuildContext context) {
-    final c = store.constraintsOf(person.id);
-    return Card(
-      child: ListTile(
-        leading: CircleAvatar(child: Text(person.fullName.isNotEmpty ? person.fullName.trim()[0] : '?')),
-        title: Text(person.fullName),
-        subtitle: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Title: ${person.title} • Gender: ${_genderLabel(person.gender)} • ${person.active ? "Aktif" : "Pasif"}'),
-            Text('Skills: ${person.skills.isEmpty ? "-" : person.skills.join(", ")}'),
-            Text('Kısıtlar: ${_constraintsLabel(c)}'),
-          ],
-        ),
-        isThreeLine: true,
-        trailing: PopupMenuButton<String>(
-          onSelected: (v) async {
-            switch (v) {
-              case 'edit':
-                final updated = await Navigator.of(context).push<Person?>(
-                  MaterialPageRoute(builder: (_) => PersonEditorPage(store: store, existing: person)),
-                );
-                if (updated != null) store.updatePerson(updated);
-                break;
-              case 'constraints':
-                final updatedC = await Navigator.of(context).push<PersonConstraints?>(
-                  MaterialPageRoute(builder: (_) => ConstraintsEditorPage(store: store, person: person)),
-                );
-                if (updatedC != null) store.saveConstraints(updatedC);
-                break;
-              case 'toggle':
-                store.toggleActive(person.id, !person.active);
-                break;
-            }
-          },
-          itemBuilder: (_) => [
-            const PopupMenuItem(value: 'edit', child: Text('Düzenle')),
-            const PopupMenuItem(value: 'constraints', child: Text('Kısıtlar')),
-            PopupMenuItem(value: 'toggle', child: Text(person.active ? 'Pasif yap' : 'Aktif yap')),
-          ],
-        ),
+    final pages = const [
+      DashboardPage(),
+      PersonListPage(),
+      RequestsPage(),
+      FlightsPage(),
+      RulesPage(),
+    ];
+    return Scaffold(
+      appBar: AppBar(title: const Text('Gozen Planlama')),
+      body: pages[index],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: index,
+        onDestinationSelected: (v) => setState(() => index = v),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.dashboard), label: 'Dashboard'),
+          NavigationDestination(icon: Icon(Icons.people), label: 'Personel'),
+          NavigationDestination(icon: Icon(Icons.event_note), label: 'Talepler'),
+          NavigationDestination(icon: Icon(Icons.flight), label: 'Uçuş'),
+          NavigationDestination(icon: Icon(Icons.rule), label: 'Kurallar'),
+        ],
       ),
     );
   }
 }
 
-class RulesPage extends StatelessWidget {
-  const RulesPage({super.key, required this.store});
-  final Store store;
+class DashboardPage extends StatelessWidget {
+  const DashboardPage({super.key});
 
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: store,
-      builder: (_, __) {
-        final r = store.rules;
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            _Card(
-              title: 'Kilit Kurallar',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: const [
-                  Text('• Öncelik: Cinsiyet > Skill > Dinlenme'),
-                  SizedBox(height: 6),
-                  Text('• 12 saat vardiya: ardışık max 2 gün (talep ile esnetilebilir)'),
-                  Text('• Gece vardiya: ardışık max 2 gün (talep ile esnetilebilir)'),
-                  Text('• Min dinlenme: 11 saat'),
-                  Text('• Her vardiya +1 ekstra Airsider (no-show buffer)'),
-                  Text('• Ekstra Airsider cinsiyeti vardiya bazlı dönüşümlü'),
-                  Text('• Gate Observer: MUST (zorunlu)'),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-            _Card(
-              title: 'Parametreler',
-              child: Column(
-                children: [
-                  _IntStepper(
-                    label: 'Min dinlenme (saat)',
-                    value: r.minRestHours,
-                    min: 8,
-                    max: 16,
-                    onChanged: (v) {
-                      r.minRestHours = v;
-                      store.notifyListeners();
-                    },
-                    helperText: 'Excel kuralında 11 saat. Şimdilik düzenlenebilir.',
-                  ),
-                  const Divider(height: 24),
-                  _IntStepper(
-                    label: '12s ardışık limit',
-                    value: r.maxConsecutive12h,
-                    min: 1,
-                    max: 5,
-                    onChanged: (v) {
-                      r.maxConsecutive12h = v;
-                      store.notifyListeners();
-                    },
-                  ),
-                  const Divider(height: 24),
-                  _IntStepper(
-                    label: 'Gece ardışık limit',
-                    value: r.maxConsecutiveNight,
-                    min: 1,
-                    max: 5,
-                    onChanged: (v) {
-                      r.maxConsecutiveNight = v;
-                      store.notifyListeners();
-                    },
-                  ),
-                  const Divider(height: 24),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: const Text('Talep varsa esnet'),
-                    subtitle: const Text('Personel talebi/manager onayı varsa ardışık limitler esneyebilir.'),
-                    value: r.allowOverrideWithRequest,
-                    onChanged: (v) {
-                      r.allowOverrideWithRequest = v;
-                      store.notifyListeners();
-                    },
-                  ),
-                  const Divider(height: 24),
-                  _IntStepper(
-                    label: '15 günde talep hakkı',
-                    value: r.requestQuotaPer15Days,
-                    min: 0,
-                    max: 15,
-                    onChanged: (v) {
-                      r.requestQuotaPer15Days = v;
-                      store.notifyListeners();
-                    },
-                  ),
-                ],
-              ),
-            ),
-          ],
-        );
-      },
-    );
+  int _count(AppStore store, TitleType t, {Gender? g}) {
+    return store.persons.where((p) {
+      return p.active && p.title == t && (g == null || p.gender == g);
+    }).length;
   }
-}
-
-class RequestsPage extends StatelessWidget {
-  const RequestsPage({super.key, required this.store});
-  final Store store;
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: store,
-      builder: (_, __) {
-        final people = store.people.where((p) => p.active).toList()..sort((a, b) => a.fullName.compareTo(b.fullName));
-        final reqs = [...store.requests]..sort((a, b) => b.date.compareTo(a.date));
+    final store = AppStoreScope.of(context);
+    final cards = <MapEntry<String, int>>[
+      MapEntry('Erkek Airsider', _count(store, TitleType.airsider, g: Gender.male)),
+      MapEntry('Kadın Airsider', _count(store, TitleType.airsider, g: Gender.female)),
+      MapEntry('Interviewer', _count(store, TitleType.interviewer)),
+      MapEntry('Tarmac Team Leader', _count(store, TitleType.tarmacTeamLeader)),
+      MapEntry('Team Leader', _count(store, TitleType.teamLeader)),
+    ];
 
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Row(
-              children: [
-                const Expanded(child: Text('Talepler', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600))),
-                FilledButton.icon(
-                  onPressed: people.isEmpty
-                      ? null
-                      : () async {
-                          final created = await Navigator.of(context).push<PersonRequest?>(
-                            MaterialPageRoute(builder: (_) => RequestEditorPage(store: store)),
-                          );
-                          if (created != null) store.addRequest(created);
-                        },
-                  icon: const Icon(Icons.add),
-                  label: const Text('Talep Ekle'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            if (reqs.isEmpty)
-              const _EmptyHint(text: 'Henüz talep yok.'),
-            for (final r in reqs) ...[
-              _RequestTile(store: store, request: r),
-              const SizedBox(height: 8),
-            ],
-          ],
-        );
-      },
-    );
-  }
-}
-
-class _RequestTile extends StatelessWidget {
-  const _RequestTile({required this.store, required this.request});
-  final Store store;
-  final PersonRequest request;
-
-  @override
-  Widget build(BuildContext context) {
-    final p = store.people.firstWhere((x) => x.id == request.personId, orElse: () => Person(id: 'x', fullName: 'Silinmiş', title: '-', gender: Gender.diger, skills: []));
-    final quota = store.rules.requestQuotaPer15Days;
-    final used = store.requestCountInWindow(request.personId, request.date);
-
-    return Card(
-      child: ListTile(
-        title: Text('${p.fullName} • ${_prefLabel(request.pref)}'),
-        subtitle: Text('${_fmtDate(request.date)} • Onay: ${request.managerApproved ? "Evet" : "Hayır"} • Puan: $used/$quota'),
-        trailing: PopupMenuButton<String>(
-          onSelected: (v) async {
-            switch (v) {
-              case 'edit':
-                final updated = await Navigator.of(context).push<PersonRequest?>(
-                  MaterialPageRoute(builder: (_) => RequestEditorPage(store: store, existing: request)),
-                );
-                if (updated != null) store.updateRequest(updated);
-                break;
-              case 'toggle':
-                store.updateRequest(PersonRequest(
-                  id: request.id,
-                  personId: request.personId,
-                  date: request.date,
-                  pref: request.pref,
-                  managerApproved: !request.managerApproved,
-                  note: request.note,
-                ));
-                break;
-              case 'delete':
-                store.deleteRequest(request.id);
-                break;
-            }
-          },
-          itemBuilder: (_) => const [
-            PopupMenuItem(value: 'edit', child: Text('Düzenle')),
-            PopupMenuItem(value: 'toggle', child: Text('Onay değiştir')),
-            PopupMenuItem(value: 'delete', child: Text('Sil')),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class ImportExportPage extends StatelessWidget {
-  const ImportExportPage({super.key, required this.store});
-  final Store store;
-
-  @override
-  Widget build(BuildContext context) {
     return ListView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(12),
       children: [
-        _Card(
-          title: 'Excel Import (placeholder)',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Uçuş Excel yükleme burada olacak (file picker + parser).'),
-              const SizedBox(height: 12),
-              FilledButton(
-                onPressed: () => _toast(context, 'Import: pubspec + paketler sonraki adım.'),
-                child: const Text('Uçuş Excel Yükle'),
+        const Text('Özet', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        ...cards.map((e) => Card(
+              child: ListTile(
+                title: Text(e.key),
+                trailing: Text(e.value.toString(),
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 12),
-        _Card(
-          title: 'Excel Export (placeholder)',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('2 çıktı: (1) Personel vardiya listesi (yayın) (2) Uçuş bazlı görevlendirme formatı.'),
-              const SizedBox(height: 12),
-              FilledButton(
-                onPressed: () => _toast(context, 'Export: pubspec + excel writer sonraki adım.'),
-                child: const Text('Personel Vardiya Excel Export'),
-              ),
-              const SizedBox(height: 8),
-              FilledButton.tonal(
-                onPressed: () => _toast(context, 'Export: pubspec + excel writer sonraki adım.'),
-                child: const Text('Uçuş Görevlendirme Excel Export'),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Not: Değişiklik durumunda minimum değişiklik + sarı highlight mantığı plan motoru ile birlikte gelecek.',
-              ),
-            ],
+            )),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Text(
+              'Uçuş: ${store.flights.length} • Personel: ${store.persons.where((p) => p.active).length} • Talepler: ${store.requests.length}',
+            ),
           ),
         ),
       ],
@@ -792,209 +900,222 @@ class ImportExportPage extends StatelessWidget {
   }
 }
 
-/* =========================
-   Editors
-========================= */
+class PersonListPage extends StatelessWidget {
+  const PersonListPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppStoreScope.of(context);
+    return Scaffold(
+      body: ListView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: store.persons.length,
+        itemBuilder: (_, i) {
+          final p = store.persons[i];
+          return Card(
+            child: ListTile(
+              title: Text('${p.name} (${titleLabel(p.title)})'),
+              subtitle: Text(
+                '${genderLabel(p.gender)} • ${appRoleLabel(p.appRole)}'
+                '${p.skills.isEmpty ? "" : " • ${p.skills.join(", ")}"}'
+                '${p.active ? "" : " • PASİF"}',
+              ),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => PersonEditorPage(person: p)),
+              ),
+              trailing: PopupMenuButton<String>(
+                onSelected: (v) {
+                  if (v == 'toggle') store.togglePersonActive(p.id);
+                  if (v == 'delete') store.deletePerson(p.id);
+                },
+                itemBuilder: (_) => [
+                  PopupMenuItem(
+                      value: 'toggle', child: Text(p.active ? 'Pasif yap' : 'Aktif yap')),
+                  const PopupMenuItem(value: 'delete', child: Text('Sil')),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const PersonEditorPage()),
+        ),
+        icon: const Icon(Icons.add),
+        label: const Text('Personel Ekle'),
+      ),
+    );
+  }
+}
 
 class PersonEditorPage extends StatefulWidget {
-  const PersonEditorPage({super.key, required this.store, this.existing});
-  final Store store;
-  final Person? existing;
+  final Person? person;
+  const PersonEditorPage({super.key, this.person});
 
   @override
   State<PersonEditorPage> createState() => _PersonEditorPageState();
 }
 
 class _PersonEditorPageState extends State<PersonEditorPage> {
-  late final TextEditingController nameCtl;
-  late final TextEditingController titleCtl;
-  late final TextEditingController roleCtl;
-  late Gender gender;
-  late bool active;
-  late List<String> skills;
+  final nameCtl = TextEditingController();
+  final noteCtl = TextEditingController();
+
+  AppRole appRole = AppRole.agent;
+  TitleType title = TitleType.airsider;
+  Gender gender = Gender.male;
+  final Set<String> selectedSkills = {};
+  bool active = true;
+
+  bool geceYok = false;
+  bool gunduzYok = false;
+  bool sabahYok = false;
+  int maxSaat = 12;
 
   @override
   void initState() {
     super.initState();
-    final p = widget.existing;
-    nameCtl = TextEditingController(text: p?.fullName ?? '');
-    titleCtl = TextEditingController(text: p?.title ?? '');
-    roleCtl = TextEditingController(text: p?.appRole ?? 'OCC');
-    gender = p?.gender ?? Gender.diger;
-    active = p?.active ?? true;
-    skills = [...(p?.skills ?? <String>[])];
+    final p = widget.person;
+    if (p != null) {
+      nameCtl.text = p.name;
+      appRole = p.appRole;
+      title = p.title;
+      gender = p.gender;
+      selectedSkills.addAll(p.skills);
+      active = p.active;
+      geceYok = p.constraints.geceYok;
+      gunduzYok = p.constraints.gunduzYok;
+      sabahYok = p.constraints.sabahYok;
+      maxSaat = p.constraints.maxVardiyaSaat;
+      noteCtl.text = p.constraints.note;
+    }
   }
 
   @override
   void dispose() {
     nameCtl.dispose();
-    titleCtl.dispose();
-    roleCtl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isEdit = widget.existing != null;
-    return Scaffold(
-      appBar: AppBar(title: Text(isEdit ? 'Personel Düzenle' : 'Personel Ekle')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          TextField(
-            controller: nameCtl,
-            decoration: const InputDecoration(labelText: 'Ad Soyad'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: titleCtl,
-            decoration: const InputDecoration(labelText: 'Title (Airsider/Interviewer/TL...)'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: roleCtl,
-            decoration: const InputDecoration(labelText: 'App Role (Admin/OCC/Supervisor/Agent)'),
-          ),
-          const SizedBox(height: 12),
-          DropdownButtonFormField<Gender>(
-            value: gender,
-            decoration: const InputDecoration(labelText: 'Gender'),
-            items: const [
-              DropdownMenuItem(value: Gender.erkek, child: Text('Erkek')),
-              DropdownMenuItem(value: Gender.kadin, child: Text('Kadın')),
-              DropdownMenuItem(value: Gender.diger, child: Text('Diğer')),
-            ],
-            onChanged: (v) => setState(() => gender = v ?? Gender.diger),
-          ),
-          const SizedBox(height: 12),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Aktif'),
-            value: active,
-            onChanged: (v) => setState(() => active = v),
-          ),
-          const SizedBox(height: 12),
-          _SkillEditor(
-            skills: skills,
-            onChanged: (v) => setState(() => skills = v),
-          ),
-          const SizedBox(height: 16),
-          FilledButton(
-            onPressed: () {
-              final name = nameCtl.text.trim();
-              if (name.isEmpty) {
-                _toast(context, 'Ad Soyad boş olamaz.');
-                return;
-              }
-              final title = titleCtl.text.trim().isEmpty ? '-' : titleCtl.text.trim();
-              final role = roleCtl.text.trim().isEmpty ? 'OCC' : roleCtl.text.trim();
-              final id = widget.existing?.id ?? Store._id();
-              final p = Person(
-                id: id,
-                fullName: name,
-                title: title,
-                gender: gender,
-                skills: skills,
-                active: active,
-                appRole: role,
-              );
-              Navigator.of(context).pop(p);
-            },
-            child: Text(isEdit ? 'Kaydet' : 'Ekle'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class ConstraintsEditorPage extends StatefulWidget {
-  const ConstraintsEditorPage({super.key, required this.store, required this.person});
-  final Store store;
-  final Person person;
-
-  @override
-  State<ConstraintsEditorPage> createState() => _ConstraintsEditorPageState();
-}
-
-class _ConstraintsEditorPageState extends State<ConstraintsEditorPage> {
-  late bool geceYok;
-  late bool gunduzYok;
-  late bool sabahYok;
-  late int maxSaat;
-  late final TextEditingController noteCtl;
-
-  @override
-  void initState() {
-    super.initState();
-    final c = widget.store.constraintsOf(widget.person.id);
-    geceYok = c.geceYok;
-    gunduzYok = c.gunduzYok;
-    sabahYok = c.sabahYok;
-    maxSaat = c.maxVardiyaSaat;
-    noteCtl = TextEditingController(text: c.note);
-  }
-
-  @override
-  void dispose() {
     noteCtl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final store = AppStoreScope.of(context);
+    final availableSkills = skillsForTitle(title);
+    selectedSkills.removeWhere((s) => !availableSkills.contains(s));
+
     return Scaffold(
-      appBar: AppBar(title: Text('Kısıtlar • ${widget.person.fullName}')),
+      appBar: AppBar(title: Text(widget.person == null ? 'Personel Ekle' : 'Personel Düzenle')),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(12),
         children: [
+          TextField(controller: nameCtl, decoration: const InputDecoration(labelText: 'Ad Soyad')),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<AppRole>(
+            value: appRole,
+            items: AppRole.values
+                .map((e) => DropdownMenuItem(value: e, child: Text(appRoleLabel(e))))
+                .toList(),
+            onChanged: (v) => setState(() => appRole = v!),
+            decoration: const InputDecoration(labelText: 'App Rolü'),
+          ),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<TitleType>(
+            value: title,
+            items: TitleType.values
+                .map((e) => DropdownMenuItem(value: e, child: Text(titleLabel(e))))
+                .toList(),
+            onChanged: (v) => setState(() => title = v!),
+            decoration: const InputDecoration(labelText: 'Title'),
+          ),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<Gender>(
+            value: gender,
+            items: Gender.values
+                .map((e) => DropdownMenuItem(value: e, child: Text(genderLabel(e))))
+                .toList(),
+            onChanged: (v) => setState(() => gender = v!),
+            decoration: const InputDecoration(labelText: 'Gender'),
+          ),
+          const SizedBox(height: 12),
+          const Text('Skills'),
+          if (availableSkills.isEmpty)
+            const Text('Bu title için skill yok.')
+          else
+            Wrap(
+              spacing: 8,
+              children: availableSkills.map((s) {
+                final selected = selectedSkills.contains(s);
+                return FilterChip(
+                  label: Text(s),
+                  selected: selected,
+                  onSelected: (v) => setState(() => v ? selectedSkills.add(s) : selectedSkills.remove(s)),
+                );
+              }).toList(),
+            ),
+          const SizedBox(height: 4),
+          const Text("Skill listesi title'a göre gösterilir.",
+              style: TextStyle(fontSize: 12, color: Colors.black54)),
+          const Divider(height: 24),
+          const Text('Kısıtlar', style: TextStyle(fontWeight: FontWeight.bold)),
           SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Gece yok'),
             value: geceYok,
             onChanged: (v) => setState(() => geceYok = v),
+            title: const Text('Gece yok'),
+            dense: true,
           ),
           SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Gündüz yok'),
             value: gunduzYok,
             onChanged: (v) => setState(() => gunduzYok = v),
+            title: const Text('Gündüz yok'),
+            dense: true,
           ),
           SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Sabah yok'),
             value: sabahYok,
             onChanged: (v) => setState(() => sabahYok = v),
+            title: const Text('Sabah yok'),
+            dense: true,
           ),
-          const SizedBox(height: 12),
-          _IntStepper(
-            label: 'Maks vardiya süresi (saat)',
+          DropdownButtonFormField<int>(
             value: maxSaat,
-            min: 4,
-            max: 12,
-            onChanged: (v) => setState(() => maxSaat = v),
+            items: const [8, 10, 12]
+                .map((e) => DropdownMenuItem(value: e, child: Text('$e saat')))
+                .toList(),
+            onChanged: (v) => setState(() => maxSaat = v!),
+            decoration: const InputDecoration(labelText: 'Maks vardiya süresi'),
+          ),
+          const SizedBox(height: 8),
+          TextField(controller: noteCtl, decoration: const InputDecoration(labelText: 'Kısıt notu')),
+          SwitchListTile(
+            value: active,
+            onChanged: (v) => setState(() => active = v),
+            title: const Text('Aktif'),
+            dense: true,
           ),
           const SizedBox(height: 12),
-          TextField(
-            controller: noteCtl,
-            maxLines: 3,
-            decoration: const InputDecoration(
-              labelText: 'Not',
-              hintText: 'Örn: hamile / süt izinli / sağlık kısıtı ...',
-            ),
-          ),
-          const SizedBox(height: 16),
           FilledButton(
             onPressed: () {
-              final c = PersonConstraints(
-                personId: widget.person.id,
-                geceYok: geceYok,
-                gunduzYok: gunduzYok,
-                sabahYok: sabahYok,
-                maxVardiyaSaat: maxSaat,
-                note: noteCtl.text.trim(),
+              if (nameCtl.text.trim().isEmpty) return;
+              final person = Person(
+                id: widget.person?.id ?? store.nextId(),
+                name: nameCtl.text.trim(),
+                appRole: appRole,
+                title: title,
+                gender: gender,
+                skills: selectedSkills.toList(),
+                active: active,
+                constraints: PersonConstraints(
+                  geceYok: geceYok,
+                  gunduzYok: gunduzYok,
+                  sabahYok: sabahYok,
+                  maxVardiyaSaat: maxSaat,
+                  note: noteCtl.text.trim(),
+                ),
               );
-              Navigator.of(context).pop(c);
+              store.addOrUpdatePerson(person);
+              Navigator.pop(context);
             },
             child: const Text('Kaydet'),
           ),
@@ -1004,130 +1125,452 @@ class _ConstraintsEditorPageState extends State<ConstraintsEditorPage> {
   }
 }
 
+class RequestsPage extends StatelessWidget {
+  const RequestsPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppStoreScope.of(context);
+    return Scaffold(
+      body: ListView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: store.requests.length,
+        itemBuilder: (_, i) {
+          final r = store.requests[i];
+          final p = store.persons.where((e) => e.id == r.personId).isNotEmpty
+              ? store.persons.firstWhere((e) => e.id == r.personId)
+              : null;
+          return Card(
+            child: ListTile(
+              title: Text('${p?.name ?? "Silinmiş"} • ${requestTypeLabel(r.type)}'),
+              subtitle: Text('${_fmtDate(r.date)}${r.managerApproved ? " • Müdür onaylı" : ""}'),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => RequestEditorPage(request: r)),
+              ),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => store.deleteRequest(r.id),
+              ),
+            ),
+          );
+        },
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const RequestEditorPage()),
+        ),
+        icon: const Icon(Icons.add),
+        label: const Text('Talep Ekle'),
+      ),
+    );
+  }
+}
+
 class RequestEditorPage extends StatefulWidget {
-  const RequestEditorPage({super.key, required this.store, this.existing});
-  final Store store;
-  final PersonRequest? existing;
+  final StaffRequest? request;
+  const RequestEditorPage({super.key, this.request});
 
   @override
   State<RequestEditorPage> createState() => _RequestEditorPageState();
 }
 
 class _RequestEditorPageState extends State<RequestEditorPage> {
-  late String personId;
-  late DateTime date;
-  late ShiftPref pref;
-  late bool managerApproved;
-  late final TextEditingController noteCtl;
+  String? personId;
+  DateTime date = DateUtils.dateOnly(DateTime.now());
+  RequestType type = RequestType.off;
+  bool managerApproved = false;
 
   @override
   void initState() {
     super.initState();
-    final e = widget.existing;
-    final firstActive = widget.store.people.firstWhere((p) => p.active, orElse: () => widget.store.people.first);
-    personId = e?.personId ?? firstActive.id;
-    date = e?.date ?? DateTime.now();
-    pref = e?.pref ?? ShiftPref.off;
-    managerApproved = e?.managerApproved ?? false;
-    noteCtl = TextEditingController(text: e?.note ?? '');
+    final r = widget.request;
+    if (r != null) {
+      personId = r.personId;
+      date = DateUtils.dateOnly(r.date);
+      type = r.type;
+      managerApproved = r.managerApproved;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppStoreScope.of(context);
+
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.request == null ? 'Talep Ekle' : 'Talep Düzenle')),
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          DropdownButtonFormField<String>(
+            value: personId,
+            items: store.persons
+                .where((p) => p.active)
+                .map((p) => DropdownMenuItem(value: p.id, child: Text(p.name)))
+                .toList(),
+            onChanged: (v) => setState(() => personId = v),
+            decoration: const InputDecoration(labelText: 'Personel'),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Tarih'),
+            subtitle: Text(_fmtDate(date)),
+            trailing: const Icon(Icons.calendar_today),
+            onTap: () async {
+              final picked = await showDatePicker(
+                context: context,
+                firstDate: DateTime(2025),
+                lastDate: DateTime(2030),
+                initialDate: date,
+              );
+              if (picked != null) setState(() => date = DateUtils.dateOnly(picked));
+            },
+          ),
+          DropdownButtonFormField<RequestType>(
+            value: type,
+            items: RequestType.values
+                .map((e) => DropdownMenuItem(value: e, child: Text(requestTypeLabel(e))))
+                .toList(),
+            onChanged: (v) => setState(() => type = v!),
+            decoration: const InputDecoration(labelText: 'Talep Tipi'),
+          ),
+          SwitchListTile(
+            value: managerApproved,
+            onChanged: (v) => setState(() => managerApproved = v),
+            title: const Text('Müdür onaylı'),
+            contentPadding: EdgeInsets.zero,
+          ),
+          const SizedBox(height: 8),
+          if (personId != null)
+            Text('15 gün içinde talep: ${store.requestsIn15Days(personId!, date)} / ${store.rules.requestLimit15Days}'),
+          const SizedBox(height: 12),
+          FilledButton(
+            onPressed: () {
+              if (personId == null) return;
+              final err = store.canAddRequest(personId!, date, editingId: widget.request?.id);
+              if (err != null) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
+                return;
+              }
+              store.addOrUpdateRequest(StaffRequest(
+                id: widget.request?.id ?? store.nextId(),
+                personId: personId!,
+                date: date,
+                type: type,
+                managerApproved: managerApproved,
+              ));
+              Navigator.pop(context);
+            },
+            child: const Text('Kaydet'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+class FlightsPage extends StatelessWidget {
+  const FlightsPage({super.key});
+
+
+  DateTime? _parseExcelDateLocal(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return DateUtils.dateOnly(v);
+    if (v is num) {
+      // Excel serial date (days since 1899-12-30)
+      final base = DateTime(1899, 12, 30);
+      return DateUtils.dateOnly(base.add(Duration(days: v.toInt())));
+    }
+    if (v is String) {
+      final s = v.trim();
+      // Accept dd.MM.yyyy or yyyy-MM-dd
+      final m1 = RegExp(r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$').firstMatch(s);
+      if (m1 != null) {
+        final d = int.parse(m1.group(1)!);
+        final mo = int.parse(m1.group(2)!);
+        final y = int.parse(m1.group(3)!);
+        return DateUtils.dateOnly(DateTime(y, mo, d));
+      }
+      final m2 = RegExp(r'^(\d{4})-(\d{1,2})-(\d{1,2})$').firstMatch(s);
+      if (m2 != null) {
+        final y = int.parse(m2.group(1)!);
+        final mo = int.parse(m2.group(2)!);
+        final d = int.parse(m2.group(3)!);
+        return DateUtils.dateOnly(DateTime(y, mo, d));
+      }
+    }
+    return null;
+  }
+
+  TimeOfDay? _parseExcelTimeLocal(dynamic v) {
+    if (v == null) return null;
+    if (v is TimeOfDay) return v;
+    if (v is DateTime) return TimeOfDay(hour: v.hour, minute: v.minute);
+    if (v is num) {
+      // Excel time fraction of day
+      final minutes = (v * 24 * 60).round();
+      final h = (minutes ~/ 60) % 24;
+      final m = minutes % 60;
+      return TimeOfDay(hour: h, minute: m);
+    }
+    if (v is String) {
+      final s = v.trim();
+      final m = RegExp(r'^(\d{1,2}):(\d{2})$').firstMatch(s);
+      if (m != null) {
+        final h = int.parse(m.group(1)!);
+        final mi = int.parse(m.group(2)!);
+        if (h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
+          return TimeOfDay(hour: h, minute: mi);
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<void> _importFlights(BuildContext context, AppStore store) async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['xlsx'],
+      withData: true,
+    );
+    if (res == null || res.files.isEmpty) return;
+    final file = res.files.first;
+    final Uint8List? bytes = file.bytes;
+    if (bytes == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Dosya okunamadı.')),
+      );
+      return;
+    }
+
+    try {
+      final excel = xl.Excel.decodeBytes(bytes);
+      final sheetName = excel.sheets.keys.contains('Sayfa1') ? 'Sayfa1' : excel.sheets.keys.first;
+      final sheet = excel.sheets[sheetName]!;
+      DateTime? currentDate;
+
+      int imported = 0;
+      for (final row in sheet.rows) {
+        if (row.isEmpty) continue;
+
+        final aVal = row.length > 0 ? row[0]?.value : null;
+        final bVal = row.length > 1 ? row[1]?.value : null;
+        final cVal = row.length > 2 ? row[2]?.value : null;
+        final dVal = row.length > 3 ? row[3]?.value : null;
+        final eVal = row.length > 4 ? row[4]?.value : null;
+
+        // Header line: date in column A (sometimes) or B.
+        final dateCandidate = _parseExcelDateLocal(aVal) ?? _parseExcelDateLocal(bVal);
+        if (dateCandidate != null) {
+          currentDate = dateCandidate;
+          continue;
+        }
+
+        // Flight rows: A=FlightNo, B=Dest, E=STD (HH:MM)
+        final flightNo = (aVal ?? '').toString().trim();
+        final dest = (bVal ?? '').toString().trim();
+
+        final std = _parseExcelTimeLocal(eVal);
+        if (currentDate != null && flightNo.isNotEmpty && dest.isNotEmpty && std != null) {
+          store.addOrUpdateFlight(FlightItem(
+            id: store.nextId(),
+            date: currentDate,
+            flightNo: flightNo.toUpperCase(),
+            destination: dest.toUpperCase(),
+            std: std,
+            sta: null,
+          ));
+          imported++;
+          continue;
+        }
+
+        // Some sheets may keep STD in D column; try fallback
+        final std2 = std ?? _parseExcelTimeLocal(dVal) ?? _parseExcelTimeLocal(cVal);
+        if (currentDate != null && flightNo.isNotEmpty && dest.isNotEmpty && std2 != null) {
+          store.addOrUpdateFlight(FlightItem(
+            id: store.nextId(),
+            date: currentDate,
+            flightNo: flightNo.toUpperCase(),
+            destination: dest.toUpperCase(),
+            std: std2,
+            sta: null,
+          ));
+          imported++;
+        }
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('İçe aktarılan uçuş: $imported')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Excel okuma hatası: $e')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppStoreScope.of(context);
+
+    return Scaffold(
+      body: ListView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: store.flights.length,
+        itemBuilder: (_, i) {
+          final f = store.flights[i];
+          return Card(
+            child: ListTile(
+              leading: const Icon(Icons.flight_takeoff),
+              title: Text('${f.flightNo} • ${f.destination}'),
+              subtitle: Text('${_fmtDate(f.date)} • STD ${_fmtTod(f.std)}${f.sta != null ? " • STA ${_fmtTod(f.sta!)}" : ""}'),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => FlightEditorPage(flight: f)),
+              ),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => store.deleteFlight(f.id),
+              ),
+            ),
+          );
+        },
+      ),
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FloatingActionButton.extended(
+            heroTag: 'importFlights',
+            onPressed: () => _importFlights(context, store),
+            icon: const Icon(Icons.upload_file),
+            label: const Text('Excel Yükle'),
+          ),
+          const SizedBox(height: 10),
+          FloatingActionButton.extended(
+            heroTag: 'addFlight',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const FlightEditorPage()),
+            ),
+            icon: const Icon(Icons.add),
+            label: const Text('Uçuş Ekle'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class FlightEditorPage extends StatefulWidget {
+  final FlightItem? flight;
+  const FlightEditorPage({super.key, this.flight});
+
+  @override
+  State<FlightEditorPage> createState() => _FlightEditorPageState();
+}
+
+class _FlightEditorPageState extends State<FlightEditorPage> {
+  DateTime date = DateUtils.dateOnly(DateTime.now());
+  final flightNoCtl = TextEditingController();
+  final destCtl = TextEditingController();
+  final stdCtl = TextEditingController(text: '09:00');
+  final staCtl = TextEditingController(text: '11:00');
+
+  @override
+  void initState() {
+    super.initState();
+    final f = widget.flight;
+    if (f != null) {
+      date = DateUtils.dateOnly(f.date);
+      flightNoCtl.text = f.flightNo;
+      destCtl.text = f.destination;
+      stdCtl.text = _fmtTod(f.std);
+      staCtl.text = f.sta == null ? '' : _fmtTod(f.sta!);
+    }
   }
 
   @override
   void dispose() {
-    noteCtl.dispose();
+    flightNoCtl.dispose();
+    destCtl.dispose();
+    stdCtl.dispose();
+    staCtl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final isEdit = widget.existing != null;
-    final people = widget.store.people.where((p) => p.active).toList()..sort((a, b) => a.fullName.compareTo(b.fullName));
-
-    final used = widget.store.requestCountInWindow(personId, date);
-    final quota = widget.store.rules.requestQuotaPer15Days;
-
+    final store = AppStoreScope.of(context);
     return Scaffold(
-      appBar: AppBar(title: Text(isEdit ? 'Talep Düzenle' : 'Talep Ekle')),
+      appBar: AppBar(title: Text(widget.flight == null ? 'Uçuş Ekle' : 'Uçuş Düzenle')),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(12),
         children: [
-          DropdownButtonFormField<String>(
-            value: personId,
-            decoration: const InputDecoration(labelText: 'Personel'),
-            items: [
-              for (final p in people) DropdownMenuItem(value: p.id, child: Text(p.fullName)),
-            ],
-            onChanged: (v) => setState(() => personId = v ?? personId),
-          ),
-          const SizedBox(height: 12),
           ListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Tarih'),
             subtitle: Text(_fmtDate(date)),
-            trailing: FilledButton.tonal(
-              onPressed: () async {
-                final picked = await showDatePicker(
-                  context: context,
-                  firstDate: DateTime(2025, 1, 1),
-                  lastDate: DateTime(2030, 12, 31),
-                  initialDate: date,
-                );
-                if (picked != null) setState(() => date = picked);
-              },
-              child: const Text('Seç'),
-            ),
+            trailing: const Icon(Icons.calendar_today),
+            onTap: () async {
+              final picked = await showDatePicker(
+                context: context,
+                firstDate: DateTime(2025),
+                lastDate: DateTime(2030),
+                initialDate: date,
+              );
+              if (picked != null) setState(() => date = DateUtils.dateOnly(picked));
+            },
           ),
-          const SizedBox(height: 12),
-          DropdownButtonFormField<ShiftPref>(
-            value: pref,
-            decoration: const InputDecoration(labelText: 'Talep Tipi'),
-            items: const [
-              DropdownMenuItem(value: ShiftPref.off, child: Text('OFF')),
-              DropdownMenuItem(value: ShiftPref.sabah, child: Text('SABAH')),
-              DropdownMenuItem(value: ShiftPref.gunduz, child: Text('GÜNDÜZ')),
-              DropdownMenuItem(value: ShiftPref.aksam, child: Text('AKŞAM')),
-              DropdownMenuItem(value: ShiftPref.gece, child: Text('GECE')),
-            ],
-            onChanged: (v) => setState(() => pref = v ?? pref),
-          ),
-          const SizedBox(height: 12),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Müdür onaylı'),
-            subtitle: Text('15 günde talep puanı: $used/$quota'),
-            value: managerApproved,
-            onChanged: (v) => setState(() => managerApproved = v),
-          ),
-          const SizedBox(height: 12),
+          TextField(controller: flightNoCtl, decoration: const InputDecoration(labelText: 'Uçuş No')),
+          const SizedBox(height: 8),
+          TextField(controller: destCtl, decoration: const InputDecoration(labelText: 'Destinasyon')),
+          const SizedBox(height: 8),
           TextField(
-            controller: noteCtl,
-            maxLines: 3,
-            decoration: const InputDecoration(
-              labelText: 'Açıklama',
-              hintText: 'Örn: 2 gün gece talebi / özel durum ...',
-            ),
-          ),
-          const SizedBox(height: 16),
+  controller: stdCtl,
+  decoration: const InputDecoration(
+    labelText: 'STD (HH:MM)',
+    hintText: '09:30',
+  ),
+  keyboardType: TextInputType.datetime,
+),
+const SizedBox(height: 8),
+TextField(
+  controller: staCtl,
+  decoration: const InputDecoration(
+    labelText: 'STA (opsiyonel, HH:MM)',
+    hintText: '11:15',
+  ),
+  keyboardType: TextInputType.datetime,
+),
+const SizedBox(height: 12),
+
           FilledButton(
             onPressed: () {
-              // Soft gate: show warning if over quota (still allow save)
-              final finalUsed = widget.store.requestCountInWindow(personId, date);
-              if (!isEdit && finalUsed >= quota) {
-                _toast(context, 'Uyarı: 15 gün içinde talep hakkı dolu ($finalUsed/$quota). Yine de kaydedildi.');
+              if (flightNoCtl.text.trim().isEmpty || destCtl.text.trim().isEmpty) return;
+              final stdParsed = parseHHMM(stdCtl.text.trim());
+              if (stdParsed == null) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('STD formatı HH:MM olmalı')));
+                return;
               }
-              final id = widget.existing?.id ?? Store._id();
-              Navigator.of(context).pop(
-                PersonRequest(
-                  id: id,
-                  personId: personId,
-                  date: date,
-                  pref: pref,
-                  managerApproved: managerApproved,
-                  note: noteCtl.text.trim(),
-                ),
-              );
+              final staText = staCtl.text.trim();
+              final staParsed = staText.isEmpty ? null : parseHHMM(staText);
+              if (staText.isNotEmpty && staParsed == null) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('STA formatı HH:MM olmalı')));
+                return;
+              }
+              store.addOrUpdateFlight(FlightItem(
+                id: widget.flight?.id ?? store.nextId(),
+                date: date,
+                flightNo: flightNoCtl.text.trim().toUpperCase(),
+                destination: destCtl.text.trim().toUpperCase(),
+                std: stdParsed,
+                sta: staParsed,
+              ));
+              Navigator.pop(context);
             },
-            child: Text(isEdit ? 'Kaydet' : 'Ekle'),
+            child: const Text('Kaydet'),
           ),
         ],
       ),
@@ -1135,211 +1578,191 @@ class _RequestEditorPageState extends State<RequestEditorPage> {
   }
 }
 
-/* =========================
-   Widgets / helpers
-========================= */
 
-class _Card extends StatelessWidget {
-  const _Card({required this.title, required this.child});
-  final String title;
-  final Widget child;
+class FlightNeedsPage extends StatelessWidget {
+  final FlightItem flight;
+  const FlightNeedsPage({super.key, required this.flight});
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 12),
-          child,
-        ]),
-      ),
-    );
-  }
-}
+    final store = AppStoreScope.of(context);
+    final items = store.needsForFlight(flight.id);
 
-class _EmptyHint extends StatelessWidget {
-  const _EmptyHint({required this.text});
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Text(text),
-      ),
-    );
-  }
-}
-
-class _IntStepper extends StatelessWidget {
-  const _IntStepper({
-    required this.label,
-    required this.value,
-    required this.min,
-    required this.max,
-    required this.onChanged,
-    this.helperText,
-  });
-
-  final String label;
-  final int value;
-  final int min;
-  final int max;
-  final ValueChanged<int> onChanged;
-  final String? helperText;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Expanded(child: Text(label)),
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('İhtiyaçlar • ${flight.flightNo}'),
+        actions: [
             IconButton(
-              onPressed: value <= min ? null : () => onChanged(value - 1),
+              tooltip: 'Vardiya öner',
+              onPressed: () => store.suggestShiftsForFlight(flight.id),
+              icon: const Icon(Icons.schedule),
+            ),
+
+          TextButton.icon(
+            onPressed: () {
+              store.generateNeedsForFlight(flight.id);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('İhtiyaçlar üretildi')),
+              );
+            },
+            icon: const Icon(Icons.auto_fix_high),
+            label: const Text('Üret'),
+          ),
+        ],
+      ),
+      body: items.isEmpty
+          ? const Center(
+              child: Text('Henüz ihtiyaç yok. Sağ üstten "Üret" ile oluştur.'),
+            )
+          : ListView.builder(
+              padding: const EdgeInsets.all(8),
+              itemCount: items.length,
+              itemBuilder: (_, i) {
+                final n = items[i];
+                final tags = <String>[
+                  titleLabel(n.requiredTitle),
+                  if (n.requiredGender != null) genderLabel(n.requiredGender!),
+                  if (n.requiredSkill != null) n.requiredSkill!,
+                ];
+                return Card(
+                  child: ListTile(
+                    title: Text(positionLabel(n.position)),
+                    subtitle: Text(tags.join(' • ')),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.remove_circle_outline),
+                          onPressed: n.requiredCount > 0
+                              ? () => store.setNeedCount(n.id, n.requiredCount - 1)
+                              : null,
+                        ),
+                        Text(
+                          n.requiredCount.toString(),
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.add_circle_outline),
+                          onPressed: () => store.setNeedCount(n.id, n.requiredCount + 1),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
+
+
+
+class RulesPage extends StatefulWidget {
+  const RulesPage({super.key});
+
+  @override
+  State<RulesPage> createState() => _RulesPageState();
+}
+
+class _RulesPageState extends State<RulesPage> {
+  @override
+  Widget build(BuildContext context) {
+    final store = AppStoreScope.of(context);
+    final r = store.rules;
+
+    Widget rowCounter(String label, int value, void Function(int) setVal,
+        {int min = 0, int max = 20}) {
+      return Card(
+        child: ListTile(
+          title: Text(label),
+          subtitle: Text('$value'),
+          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+            IconButton(
+              onPressed: value > min ? () => setState(() => setVal(value - 1)) : null,
               icon: const Icon(Icons.remove_circle_outline),
             ),
-            Text('$value', style: const TextStyle(fontFeatures: [FontFeature.tabularFigures()])),
             IconButton(
-              onPressed: value >= max ? null : () => onChanged(value + 1),
+              onPressed: value < max ? () => setState(() => setVal(value + 1)) : null,
               icon: const Icon(Icons.add_circle_outline),
             ),
-          ],
+          ]),
         ),
-        if (helperText != null) ...[
-          const SizedBox(height: 4),
-          Text(helperText!, style: Theme.of(context).textTheme.bodySmall),
-        ],
+      );
+    }
+
+    return ListView(
+      padding: const EdgeInsets.all(8),
+      children: [
+        rowCounter('15 günde talep limiti', r.requestLimit15Days, (v) {
+          r.requestLimit15Days = v;
+          store.notifyRulesChanged();
+        }),
+        rowCounter('Üst üste çalışma günü', r.maxConsecutiveWorkDays, (v) {
+          r.maxConsecutiveWorkDays = v;
+          store.notifyRulesChanged();
+        }, min: 1, max: 15),
+        rowCounter('Üst üste 12 saat günü', r.maxConsecutive12hDays, (v) {
+          r.maxConsecutive12hDays = v;
+          store.notifyRulesChanged();
+        }, min: 1, max: 7),
+        rowCounter('Üst üste gece günü', r.maxConsecutiveNightDays, (v) {
+          r.maxConsecutiveNightDays = v;
+          store.notifyRulesChanged();
+        }, min: 1, max: 7),
+        rowCounter('Min dinlenme saati', r.minRestHoursBetweenShifts, (v) {
+          r.minRestHoursBetweenShifts = v;
+          store.notifyRulesChanged();
+        }, min: 8, max: 16),
+        Card(
+          child: Column(
+            children: [
+              SwitchListTile(
+                value: r.extraAirsiderPerShift,
+                onChanged: (v) => setState(() {
+                  r.extraAirsiderPerShift = v;
+                  store.notifyRulesChanged();
+                }),
+                title: const Text('Her vardiyada +1 ekstra Airsider'),
+              ),
+              SwitchListTile(
+                value: r.alternateExtraAirsiderGender,
+                onChanged: (v) => setState(() {
+                  r.alternateExtraAirsiderGender = v;
+                  store.notifyRulesChanged();
+                }),
+                title: const Text('Ekstra Airsider cinsiyet dönüşümlü'),
+              ),
+              ListTile(
+                title: const Text('Başlangıç ekstra cinsiyet'),
+                trailing: DropdownButton<Gender>(
+                  value: r.startExtraAirsiderGender,
+                  items: Gender.values
+                      .map((g) => DropdownMenuItem(value: g, child: Text(genderLabel(g))))
+                      .toList(),
+                  onChanged: (v) => setState(() {
+                    r.startExtraAirsiderGender = v!;
+                    store.notifyRulesChanged();
+                  }),
+                ),
+              ),
+              SwitchListTile(
+                value: r.gateObserverMust,
+                onChanged: (v) => setState(() {
+                  r.gateObserverMust = v;
+                  store.notifyRulesChanged();
+                }),
+                title: const Text('Gate Observer MUST'),
+              ),
+            ],
+          ),
+        ),
       ],
     );
   }
 }
 
-class _SkillEditor extends StatefulWidget {
-  const _SkillEditor({required this.skills, required this.onChanged});
-  final List<String> skills;
-  final ValueChanged<List<String>> onChanged;
+String _fmtDate(DateTime d) =>
+    '${d.day.toString().padLeft(2, '0')}.${d.month.toString().padLeft(2, '0')}.${d.year}';
 
-  @override
-  State<_SkillEditor> createState() => _SkillEditorState();
-}
-
-class _SkillEditorState extends State<_SkillEditor> {
-  late List<String> skills;
-  final TextEditingController ctl = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    skills = [...widget.skills];
-  }
-
-  @override
-  void dispose() {
-    ctl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return _Card(
-      title: 'Skills',
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final s in skills)
-                InputChip(
-                  label: Text(s),
-                  onDeleted: () {
-                    setState(() => skills.remove(s));
-                    widget.onChanged([...skills]);
-                  },
-                ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: ctl,
-                  decoration: const InputDecoration(
-                    labelText: 'Skill ekle',
-                    hintText: 'Örn: APIS, CHUTE, RAMP...',
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton.tonal(
-                onPressed: () {
-                  final v = ctl.text.trim();
-                  if (v.isEmpty) return;
-                  if (!skills.contains(v)) {
-                    setState(() => skills.add(v));
-                    widget.onChanged([...skills]);
-                  }
-                  ctl.clear();
-                },
-                child: const Text('Ekle'),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-String _fmtDate(DateTime d) {
-  String two(int x) => x.toString().padLeft(2, '0');
-  return '${two(d.day)}.${two(d.month)}.${d.year}';
-}
-
-String _genderLabel(Gender g) {
-  switch (g) {
-    case Gender.erkek:
-      return 'Erkek';
-    case Gender.kadin:
-      return 'Kadın';
-    case Gender.diger:
-      return 'Diğer';
-  }
-}
-
-String _prefLabel(ShiftPref p) {
-  switch (p) {
-    case ShiftPref.off:
-      return 'OFF';
-    case ShiftPref.sabah:
-      return 'SABAH';
-    case ShiftPref.gunduz:
-      return 'GÜNDÜZ';
-    case ShiftPref.aksam:
-      return 'AKŞAM';
-    case ShiftPref.gece:
-      return 'GECE';
-  }
-}
-
-String _constraintsLabel(PersonConstraints c) {
-  final parts = <String>[];
-  if (c.sabahYok) parts.add('Sabah yok');
-  if (c.gunduzYok) parts.add('Gündüz yok');
-  if (c.geceYok) parts.add('Gece yok');
-  parts.add('Max ${c.maxVardiyaSaat}h');
-  return parts.join(' • ');
-}
-
-void _toast(BuildContext context, String msg) {
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text(msg)),
-  );
-}
+String _fmtTod(TimeOfDay t) =>
+    '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
